@@ -3,141 +3,190 @@
 #include <string.h>
 #include <cuda_runtime.h>
 
-#define MAX_PW 100000
-#define ENC_LEN 11     // 10 chars + null
-#define RAW_LEN 5      // 2 letters + 2 digits + null
-#define TOTAL 67600    // 26*26*10*10
-__device__ void encrypt(const char *rawPassword, char *newPassword) {
-	newPassword[0] = rawPassword[0] + 2;
-    newPassword[1] = rawPassword[0] - 2;
-	newPassword[2] = rawPassword[0] + 1;
-	newPassword[3] = rawPassword[1] + 3;
-	newPassword[4] = rawPassword[1] - 3;
-	newPassword[5] = rawPassword[1] - 1;
-	newPassword[6] = rawPassword[2] + 2;
-	newPassword[7] = rawPassword[2] - 2;
-	newPassword[8] = rawPassword[3] + 4;
-	newPassword[9] = rawPassword[3] - 4;
-	newPassword[10] = '\0';
-    for(int i =0; i<10; i++){
-		if(i >= 0 && i < 6){ 
-			if(newPassword[i] > 122){
-				newPassword[i] = (newPassword[i] - 122) + 97;
-			}else if(newPassword[i] < 97){
-				newPassword[i] = (97 - newPassword[i]) + 97;
-			}
-		}else{
-			if(newPassword[i] > 57){
-				newPassword[i] = (newPassword[i] - 57) + 48;
-			}else if(newPassword[i] < 48){
-				newPassword[i] = (48 - newPassword[i]) + 48;
-			}
-		}
-	}
-}
-__device__ int match(const char *a, const char *b) {
-    for (int i = 0; i < 10; i++)
-        if (a[i] != b[i]) return 0;
-    return 1;
-}
-__global__ void crack(const char *enc_list, int npw, char *results, int *found){
-    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long totalWork = (long long)npw * (long long)TOTAL;
-    if (gid >= totalWork) return;
-    int p = (int)(gid / TOTAL);int idx = (int)(gid % TOTAL);if (found[p]) return;
-    // generate candidate
-    int temp = idx;
+#define MAX_PASSWORDS 100000
+#define ENCRYPTED_LEN 11        // 10 chars + null terminator
+#define PLAIN_LEN     5         // aa00 + null
+#define TOTAL_CANDIDATES 67600  // 26*26*10*10
 
+__device__ void encrypt_password(const char *plain, char *encrypted)
+{
+    encrypted[0] = plain[0] + 2;
+    encrypted[1] = plain[0] - 2;
+    encrypted[2] = plain[0] + 1;
+    encrypted[3] = plain[1] + 3;
+    encrypted[4] = plain[1] - 3;
+    encrypted[5] = plain[1] - 1;
+    encrypted[6] = plain[2] + 2;
+    encrypted[7] = plain[2] - 2;
+    encrypted[8] = plain[3] + 4;
+    encrypted[9] = plain[3] - 4;
+    encrypted[10] = '\0';
 
-    char digit1 = '0' + (temp % 10);temp /= 10;
-    char digit10 = '0' + (temp % 10);temp /= 10;
-    char letter1 = 'a' + (temp % 26); temp /= 26;
-    char letter0 = 'a' + temp;
-    char raw[RAW_LEN] = {letter0, letter1, digit10, digit1, 0};
-    char candidate[ENC_LEN];
-    encrypt(raw, candidate);
-    const char *target = enc_list + p * ENC_LEN;
-    if (match(candidate, target)) {
-        if (atomicCAS(&found[p], 0, 1) == 0) {
-            char *out = results + p * RAW_LEN;
-        out[0] = raw[0];
-        out[1] = raw[1];
-        out[2] = raw[2];
-        out[3] = raw[3];
-        out[4] = '\0';
+    for (int i = 0; i < 10; i++) {
+        if (i < 6) {  // letters
+            if (encrypted[i] > 'z')
+                encrypted[i] = (encrypted[i] - 'z') + 'a';
+            else if (encrypted[i] < 'a')
+                encrypted[i] = ('a' - encrypted[i]) + 'a';
+        } else {      // digits
+            if (encrypted[i] > '9')
+                encrypted[i] = (encrypted[i] - '9') + '0';
+            else if (encrypted[i] < '0')
+                encrypted[i] = ('0' - encrypted[i]) + '0';
         }
     }
 }
 
-int load_file(const char *fname, char **data, int *count) {
-    FILE *f = fopen(fname, "r");
-    if (!f) { perror("open"); return 1; }
-    *data = (char*)malloc(MAX_PW * ENC_LEN);*count = 0;
-    char buf[32];
-    while (fgets(buf, sizeof(buf), f) && *count < MAX_PW) {
-        if (strlen(buf) >= 10) {
-            buf[strcspn(buf, "\n")] = 0;
-            strcpy(*data + (*count) * ENC_LEN, buf);
+__device__ int passwords_match(const char *a, const char *b)
+{
+    for (int i = 0; i < 10; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+__global__ void crack_kernel(const char *encrypted_list, int num_passwords,
+                            char *results, int *found_flags)
+{
+    long long global_id = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total_work = (long long)num_passwords * TOTAL_CANDIDATES;
+
+    if (global_id >= total_work)
+        return;
+
+    int pw_index = global_id / TOTAL_CANDIDATES;
+    int cand_index = global_id % TOTAL_CANDIDATES;
+
+    if (found_flags[pw_index])
+        return;  // already cracked by another thread
+
+    // Generate candidate: format like "ab12"
+    int temp = cand_index;
+    char d1 = '0' + (temp % 10); temp /= 10;
+    char d0 = '0' + (temp % 10); temp /= 10;
+    char l1 = 'a' + (temp % 26); temp /= 26;
+    char l0 = 'a' + temp;
+
+    char plain[PLAIN_LEN] = { l0, l1, d0, d1, '\0' };
+
+    char candidate[ENCRYPTED_LEN];
+    encrypt_password(plain, candidate);
+
+    const char *target = encrypted_list + pw_index * ENCRYPTED_LEN;
+
+    if (passwords_match(candidate, target)) {
+        if (atomicCAS(&found_flags[pw_index], 0, 1) == 0) {
+            char *out = results + pw_index * PLAIN_LEN;
+            out[0] = l0;
+            out[1] = l1;
+            out[2] = d0;
+            out[3] = d1;
+            out[4] = '\0';
+        }
+    }
+}
+
+int load_encrypted(const char *filename, char **data, int *count)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        perror("Failed to open file");
+        return 1;
+    }
+
+    *data = (char *)malloc(MAX_PASSWORDS * ENCRYPTED_LEN);
+    if (!*data) {
+        fclose(fp);
+        return 1;
+    }
+
+    *count = 0;
+    char line[64];
+
+    while (fgets(line, sizeof(line), fp) && *count < MAX_PASSWORDS) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) >= 10) {
+            strcpy(*data + (*count) * ENCRYPTED_LEN, line);
             (*count)++;
         }
     }
-    fclose(f);
+
+    fclose(fp);
     return 0;
 }
 
-int save_results(char *results, int n) {
-    FILE *f = fopen("decrypted.txt", "w");
-    if (!f) return 1;
-
-    for (int i = 0; i < n; i++) {
-        char *pw = results + i * RAW_LEN;
-        if (pw[0]) fprintf(f, "%s\n", pw);
-    }
-    fclose(f);
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    if (argc != 2) {
-        printf("Usage: %s <encrypted_file>\n", argv[0]);
+int write_results(const char *results, int count)
+{
+    FILE *fp = fopen("decrypted.txt", "w");
+    if (!fp) {
+        perror("Failed to create decrypted.txt");
         return 1;
     }
-    char *h_enc = NULL; int npw = 0;
-    if (load_file(argv[1], &h_enc, &npw)) return 1;
-    if (npw == 0) { free(h_enc); return 1; }
 
+    for (int i = 0; i < count; i++) {
+        const char *pw = results + i * PLAIN_LEN;
+        if (pw[0] != '\0')  // only write if found
+            fprintf(fp, "%s\n", pw);
+    }
 
-    printf("Loaded %d passwords, starting crack...\n", npw);
+    fclose(fp);
+    return 0;
+}
 
-    char *d_enc, *d_res;
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <encrypted_file.txt>\n", argv[0]);
+        return 1;
+    }
+
+    char *host_encrypted = NULL;
+    int num_passwords = 0;
+
+    if (load_encrypted(argv[1], &host_encrypted, &num_passwords)) {
+        return 1;
+    }
+
+    if (num_passwords == 0) {
+        printf("No valid passwords found in file.\n");
+        free(host_encrypted);
+        return 0;
+    }
+
+    printf("Loaded %d encrypted passwords. Starting brute-force...\n", num_passwords);
+
+    char *d_encrypted, *d_results;
     int *d_found;
-    cudaMalloc(&d_enc, npw * ENC_LEN);
-    cudaMalloc(&d_res, npw * RAW_LEN);
-    
-    cudaMalloc(&d_found, npw * sizeof(int));
 
-    cudaMemcpy(d_enc, h_enc, npw * ENC_LEN, cudaMemcpyHostToDevice);
-    cudaMemset(d_res, 0, npw * RAW_LEN);
-    cudaMemset(d_found, 0, npw * sizeof(int));
+    cudaMalloc(&d_encrypted, num_passwords * ENCRYPTED_LEN);
+    cudaMalloc(&d_results,   num_passwords * PLAIN_LEN);
+    cudaMalloc(&d_found,     num_passwords * sizeof(int));
 
-    int threads = 256;
-    long long totalWork = (long long)npw * (long long)TOTAL;
-    int blocks = (int)((totalWork + threads - 1) / threads);
+    cudaMemcpy(d_encrypted, host_encrypted, num_passwords * ENCRYPTED_LEN, cudaMemcpyHostToDevice);
+    cudaMemset(d_results, 0, num_passwords * PLAIN_LEN);
+    cudaMemset(d_found,   0, num_passwords * sizeof(int));
 
-    crack<<<blocks, threads>>>(d_enc, npw, d_res, d_found);
+    int threads_per_block = 256;
+    long long total_threads_needed = (long long)num_passwords * TOTAL_CANDIDATES;
+    int num_blocks = (total_threads_needed + threads_per_block - 1) / threads_per_block;
+
+    crack_kernel<<<num_blocks, threads_per_block>>>(d_encrypted, num_passwords, d_results, d_found);
 
     cudaDeviceSynchronize();
 
-    char *results = (char*)malloc(npw * RAW_LEN);
-    cudaMemcpy(results, d_res, npw * RAW_LEN, cudaMemcpyDeviceToHost);
+    char *host_results = (char *)malloc(num_passwords * PLAIN_LEN);
+    cudaMemcpy(host_results, d_results, num_passwords * PLAIN_LEN, cudaMemcpyDeviceToHost);
 
-    save_results(results, npw);
-    printf("Done! Check decrypted.txt\n");
+    write_results(host_results, num_passwords);
 
+    printf("Cracking complete. Results saved to decrypted.txt\n");
 
-    // cleanup
-    cudaFree(d_enc); cudaFree(d_res); cudaFree(d_found);
-    free(h_enc); free(results);
+    // Cleanup
+    cudaFree(d_encrypted);
+    cudaFree(d_results);
+    cudaFree(d_found);
+    free(host_encrypted);
+    free(host_results);
 
     return 0;
 }
